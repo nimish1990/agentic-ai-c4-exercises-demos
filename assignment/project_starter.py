@@ -351,6 +351,7 @@ def get_stock_level(item_name: str, as_of_date: Union[str, datetime]) -> pd.Data
         as_of_date = as_of_date.isoformat()
 
     # SQL query to compute net stock level for the item
+    # Use LOWER() on both sides so 'A4 Glossy Paper' correctly finds 'Glossy paper' seed rows.
     stock_query = """
         SELECT
             item_name,
@@ -360,7 +361,7 @@ def get_stock_level(item_name: str, as_of_date: Union[str, datetime]) -> pd.Data
                 ELSE 0
             END), 0) AS current_stock
         FROM transactions
-        WHERE item_name = :item_name
+        WHERE LOWER(item_name) = LOWER(:item_name)
         AND transaction_date <= :as_of_date
     """
 
@@ -591,6 +592,24 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 ########################
 ########################
 
+import threading as _threading
+
+# ---------------------------------------------------------------------------
+# Transaction serialization (no helper function modified)
+# ---------------------------------------------------------------------------
+# smolagents executes multiple tool calls in parallel within a single step.
+# SQLite's last_insert_rowid() is connection-scoped: if two INSERTs happen
+# concurrently, each SELECT may return the other call's rowid → duplicate IDs.
+# Re-binding create_transaction through a lock serialises INSERT+SELECT pairs
+# so each call gets its own unique ID. The original helper is never edited.
+_txn_lock = _threading.Lock()
+_create_transaction_original = create_transaction
+
+def create_transaction(item_name, transaction_type, quantity, price, date):
+    """Thread-safe wrapper — serialises INSERT + last_insert_rowid() SELECT."""
+    with _txn_lock:
+        return _create_transaction_original(item_name, transaction_type, quantity, price, date)
+
 import os
 import dotenv
 from smolagents import CodeAgent, ToolCallingAgent, tool, LiteLLMModel
@@ -626,7 +645,15 @@ _ITEM_NAME_ALIASES: List[tuple] = [
     # cardstock / card stock
     ("cardstock",       "Cardstock"),
     ("card stock",      "Cardstock"),
-    # colored / colourful paper
+    # colorful/colourful + another paper type → resolve to THAT paper type (adjective only)
+    # These must come BEFORE the generic "colored paper" entries so the longer alias wins
+    ("colorful poster paper",      "Poster paper"),
+    ("colourful poster paper",     "Poster paper"),
+    ("colorful construction paper","Construction paper"),
+    ("colourful construction paper","Construction paper"),
+    ("colorful cardstock",         "Cardstock"),
+    ("colourful cardstock",        "Cardstock"),
+    # colored / colourful paper (standalone → Colored paper)
     ("colored paper",   "Colored paper"),
     ("coloured paper",  "Colored paper"),
     ("colourful paper", "Colored paper"),
@@ -818,7 +845,7 @@ def check_inventory_tool(item_name: str, request_date: str) -> str:
     status = (
         f"⚠️  REORDER REQUIRED — stock ({stock} units) is at or below the "
         f"minimum threshold ({min_level} units). "
-        f"You MUST call reorder_stock_tool for '{item_name}'."
+        f"smart_order_tool will automatically handle the reorder for '{item_name}'."
         if needs_reorder
         else f"✅ Stock OK — {stock} units available (minimum threshold: {min_level} units)."
     )
@@ -1059,6 +1086,177 @@ def reorder_stock_tool(
 
 
 
+@tool
+def smart_order_tool(
+    item_name: str,
+    quantity: int,
+    unit_price: float,
+    order_date: str,
+    customer_sale_price: float = 0.0,
+    delivery_date: str = "",
+) -> str:
+    """
+    Automatically decides SELL vs REORDER in Python code — not left to the LLM.
+
+    Simple rule:
+      SELL  (fulfill from stock NOW):
+            available stock >= requested quantity  AND  stock > min_stock_level
+      REORDER (place supplier order):
+            available stock < requested quantity   OR   stock <= min_stock_level
+
+    For SELL   : records a 'sales' transaction on order_date.
+                 Applies 10% bulk discount automatically if quantity >= 500.
+    For REORDER: records a 'stock_orders' transaction on order_date (supplier cost),
+                 then records a 'sales' transaction on order_date at customer_sale_price
+                 (same-day model — both legs hit the DB on the order date so inventory
+                 stays neutral and cash immediately reflects the net margin).
+                 10% bulk discount applied automatically if quantity >= 500.
+                 If customer_sale_price is 0 or omitted, falls back to unit_price
+                 (catalog price) so a customer sale is ALWAYS recorded on reorders.
+
+    Args:
+        item_name           : Exact catalog name of the item.
+        quantity            : Number of units the customer wants.
+        unit_price          : Catalog unit price.
+        order_date          : ISO date (YYYY-MM-DD) of the customer request.
+        customer_sale_price : Per-unit price to charge the customer for REORDER items.
+                              Defaults to unit_price when omitted or 0 — a customer
+                              sale is always recorded, even if not explicitly provided.
+        delivery_date       : Expected delivery date for REORDER (ISO YYYY-MM-DD).
+                              Informational only — the sale is recorded on order_date.
+
+    Returns:
+        Confirmation message with decision made, transaction IDs, and amounts.
+    """
+    # 0. Auto-resolve item_name to the official catalog name.
+    #    This is a safety net in case the LLM skipped normalize_item_name_tool
+    #    or passed a partially-qualified name (e.g. 'A4 Glossy Paper').
+    resolved = next(
+        (item["item_name"] for item in paper_supplies
+         if item["item_name"].lower() == item_name.strip().lower()),
+        None,
+    )
+    if resolved is None:
+        # Try the alias table as a second pass
+        from_alias = _resolve_item_name(item_name)
+        resolved = next(
+            (item["item_name"] for item in paper_supplies
+             if item["item_name"].lower() == from_alias.lower()),
+            None,
+        )
+    if resolved is None:
+        return (
+            f"ERROR: '{item_name}' could not be resolved to any official catalog item. "
+            "No transaction recorded. Check get_catalog_items_tool for valid names."
+        )
+    item_name = resolved   # use the exact catalog name for all subsequent logic
+
+    # 1. Current stock as of order_date
+    stock_df = get_stock_level(item_name, order_date)
+    stock = int(stock_df["current_stock"].iloc[0]) if not stock_df.empty else 0
+
+    # 2. Minimum stock threshold from inventory table
+    try:
+        inv_df = pd.read_sql(
+            "SELECT min_stock_level FROM inventory WHERE LOWER(item_name) = LOWER(:name)",
+            db_engine,
+            params={"name": item_name},
+        )
+        min_level = int(inv_df["min_stock_level"].iloc[0]) if not inv_df.empty else 0
+    except Exception:
+        min_level = 0
+
+    # 3. Deterministic SELL vs REORDER decision
+    can_sell = (stock >= quantity) and (stock > min_level)
+
+    if can_sell:
+        # ── SELL: fulfill from existing stock ──────────────────────────────
+        price = unit_price * quantity
+        if quantity >= 500:
+            price *= 0.90          # 10% bulk discount
+        txn_id = create_transaction(item_name, "sales", quantity, price, order_date)
+        discount_note = " (10% bulk discount applied)" if quantity >= 500 else ""
+        return (
+            f"[SELL] Sold {quantity} units of '{item_name}' on {order_date} "
+            f"for ${price:.2f}{discount_note}. Transaction ID: {txn_id}. "
+            f"Stock was {stock} units (min threshold: {min_level})."
+        )
+    else:
+        # ── REORDER: place supplier order ──────────────────────────────────
+        catalog_entry = next(
+            (item for item in paper_supplies
+             if item["item_name"].lower() == item_name.lower()),
+            None,
+        )
+        if catalog_entry is None:
+            return (
+                f"ERROR: '{item_name}' is not in the catalog. No transaction recorded."
+            )
+        official_price = float(catalog_entry["unit_price"])
+        safe_unit_price = (
+            official_price
+            if (unit_price <= 0 or abs(unit_price - official_price) > official_price * 0.5)
+            else unit_price
+        )
+        supplier_cost = safe_unit_price * quantity
+        txn_id = create_transaction(item_name, "stock_orders", quantity, supplier_cost, order_date)
+        effective_delivery = get_supplier_delivery_date(order_date, quantity)
+
+        reason = (
+            f"insufficient stock ({stock} < {quantity} requested)"
+            if stock < quantity
+            else f"stock ({stock}) at/below min threshold ({min_level})"
+        )
+        result = (
+            f"[REORDER] Ordered {quantity} units of '{item_name}' on {order_date} "
+            f"for ${supplier_cost:.2f} (${safe_unit_price:.3f}/unit). "
+            f"Reason: {reason}. "
+            f"Estimated delivery: {effective_delivery}. Supplier Transaction ID: {txn_id}."
+        )
+
+        # ── Two distinct reorder triggers → different accounting treatments ──
+        #
+        # Case A — INSUFFICIENT STOCK  (stock < quantity)
+        #   Customer placed an order we cannot fill from shelf stock.
+        #   Buy from supplier AND record the customer sale immediately
+        #   (same-day model). Inventory stays neutral; cash shows net margin.
+        #   If LLM omitted customer_sale_price, fall back to catalog price so
+        #   revenue is never silently omitted.
+        #
+        # Case B — THRESHOLD REORDER  (stock <= min_level but stock >= quantity)
+        #   Stock dipped to the safety floor. Pure inventory replenishment —
+        #   no specific customer order is driving this. Only the supplier
+        #   purchase (stock_orders) hits the books; NO customer sale recorded.
+        if stock < quantity:
+            # Case A: customer-order-driven → record customer sale
+            effective_customer_price = customer_sale_price if customer_sale_price > 0 else safe_unit_price
+            sale_date = order_date   # same-day model
+            discount_factor = 0.9 if quantity >= 500 else 1.0
+            customer_unit    = effective_customer_price * discount_factor
+            customer_revenue = customer_unit * quantity
+            sale_txn_id = create_transaction(
+                item_name, "sales", quantity, customer_revenue, sale_date
+            )
+            discount_note = " (10% bulk discount applied)" if quantity >= 500 else ""
+            fallback_note = " (customer price defaulted to catalog price)" if customer_sale_price <= 0 else ""
+            result += (
+                f"\nCustomer sale recorded: {quantity} units of '{item_name}' on {sale_date} "
+                f"at ${customer_unit:.3f}/unit = ${customer_revenue:.2f}{discount_note}{fallback_note}. "
+                f"Customer Sale Transaction ID: {sale_txn_id}."
+                f" (Supplier delivery by {effective_delivery}.)"
+            )
+        else:
+            # Case B: threshold-only restocking → NO customer sale
+            result += (
+                f"\nNote: Stock replenishment only — no customer sale recorded. "
+                f"Stock ({stock} units) was at/below minimum threshold ({min_level} units). "
+                f"Inventory will be replenished upon supplier delivery ({effective_delivery})."
+            )
+
+        return result
+
+
+
 # ---------------------------------------------------------------------------
 # 3. Worker Agents
 # ---------------------------------------------------------------------------
@@ -1089,14 +1287,19 @@ quoting_agent = ToolCallingAgent(
         "The orchestrator provides you with exact item names, quantities, and verified unit prices in the task string, "
         "split into SELL items (fulfilled from existing stock) and REORDER items (ordered from supplier). "
         "Use those prices exactly as given — do NOT call any tool to look up prices or inventory. "
-        "BULK DISCOUNT RULE (apply this mechanically, no exceptions):\n"
-        "  - SELL items with qty >= 500: apply a 10% discount. This is a customer sales incentive.\n"
-        "  - SELL items with qty < 500: NO discount.\n"
-        "  - REORDER items: NEVER apply a discount, regardless of quantity. "
-        "    Reorders are supplier purchases and are always at full unit price.\n"
-        "  - Never apply a discount based on combined totals across different items.\n"
-        "Use search_quotes_tool to reference similar past quotes for consistency. "
-        "Show per-item subtotals (with discount applied where applicable) and compute the grand total. "
+        "DISCOUNT RULE (apply this mechanically, no exceptions):\n"
+        "  CUSTOMER PRICE (what the customer pays):\n"
+        "    - qty >= 500: apply 10% bulk discount to customer price only.\n"
+        "    - qty < 500: no discount.\n"
+        "  SUPPLIER COST (what we pay the supplier = catalog unit price × qty):\n"
+        "    - NEVER discounted, regardless of quantity.\n"
+        "    - Always full catalog price. Supplier costs are internal — do not show them in the customer quote.\n"
+        "Your quote shows ONLY CUSTOMER-FACING prices (with discount applied where qty>=500).\n"
+        "   Never apply a discount based on combined totals across different items.\n"
+        "Use search_quotes_tool to reference similar past quotes for consistency.\n"
+        "For each line item: show base unit price, discount note (if applicable), and discounted subtotal.\n"
+        "GRAND TOTAL IN QUOTE = SUM of all customer-facing subtotals only. "
+        "Do NOT include supplier costs in this quote total.\n"
         "CRITICAL: Call final_answer as soon as you have the quote. Do NOT loop."
     ),
     max_steps=5,
@@ -1107,37 +1310,37 @@ order_agent = ToolCallingAgent(
         get_catalog_items_tool,
         normalize_item_name_tool,
         get_catalog_item_price_tool,
-        check_inventory_tool,
-        fulfill_order_tool,
-        reorder_stock_tool,
+        smart_order_tool,
     ],
     model=model,
     name="order_agent",
     description=(
         "You are the order_agent for The Beaver's Choice Paper Company. "
-        "Your job is to record supplier purchases and customer sales for every item.\n"
+        "Your job is to record every transaction for the customer order.\n"
         "\n"
-        "=== PROCESSING STEPS ===\n"
-        "STEP 0 — Normalize: Call normalize_item_name_tool on EVERY item name first. "
-        "Use only the normalized catalog name in all subsequent calls. "
-        "If normalize_item_name_tool returns 'Could not map', skip that item.\n"
-        "STEP 1 — Price: Call get_catalog_item_price_tool to confirm unit price. Never use $0.\n"
-        "STEP 2 — For SELL items: Call check_inventory_tool to confirm stock, then call fulfill_order_tool. "
-        "Set apply_bulk_discount=True if quantity >= 500, else False. "
-        "Use order_date = REQUEST DATE from the task header.\n"
-        "STEP 3 — For REORDER items: Call reorder_stock_tool with ALL of these parameters:\n"
-        "  - item_name: the normalized catalog name\n"
-        "  - quantity: units to order\n"
-        "  - unit_price: supplier_cost from task (catalog price, NO discount — supplier pays full price)\n"
-        "  - order_date: REQUEST DATE from the task header\n"
-        "  - customer_sale_price: customer_price from task (same as catalog price)\n"
-        "  - delivery_date: delivery_date from task\n"
-        "  The tool will automatically record BOTH the supplier purchase AND the customer sale.\n"
-        "  The 10% bulk discount is applied automatically by the tool when quantity >= 500.\n"
-        "  IMPORTANT: You MUST pass customer_sale_price and delivery_date — do not omit them.\n"
-        "STEP 4 — Call final_answer after ALL items are processed with a clear summary."
+        "=== PROCESSING STEPS (follow in order) ===\n"
+        "STEP 0 — Normalize: Call normalize_item_name_tool on EVERY item name. "
+        "Use only the returned catalog name in all subsequent steps. "
+        "Skip any item where normalize_item_name_tool returns 'Could not map'.\n"
+        "STEP 1 — Price: Call get_catalog_item_price_tool to get the official unit price. "
+        "Never use $0 or a guessed price.\n"
+        "STEP 2 — Order: Call smart_order_tool for EVERY item with these parameters:\n"
+        "  - item_name          : normalized catalog name from STEP 0\n"
+        "  - quantity           : units the customer wants (TOTAL quantity — see rule below)\n"
+        "  - unit_price         : official price from STEP 1\n"
+        "  - order_date         : REQUEST DATE from the task header (YYYY-MM-DD)\n"
+        "  - customer_sale_price: same as unit_price (the tool will use it for the customer sale)\n"
+        "  - delivery_date      : expected delivery date from the task (if provided), else leave empty\n"
+        "  The tool AUTOMATICALLY decides SELL vs REORDER in code — you do NOT need to decide.\n"
+        "  It also applies the 10% bulk discount automatically when quantity >= 500.\n"
+        "  ██ ONE CALL PER ITEM — NO EXCEPTIONS ██\n"
+        "  Call smart_order_tool EXACTLY ONCE per catalog item, using the FULL total quantity.\n"
+        "  NEVER split one item into multiple calls (e.g., '500 reams' = one call with qty=500).\n"
+        "  Splitting causes duplicate transactions and incorrect financial records.\n"
+        "STEP 3 — Call final_answer with a clear summary of every item processed, "
+        "the decision made (SELL or REORDER), and all transaction IDs."
     ),
-    max_steps=20,
+    max_steps=10,
 )
 
 # ---------------------------------------------------------------------------
@@ -1157,6 +1360,28 @@ orchestrator = ToolCallingAgent(
         "  • inventory_agent — checks stock and delivery timelines\n"
         "  • quoting_agent   — produces competitive price quotes\n"
         "  • order_agent     — finalises orders and restocks inventory\n\n"
+        "═══════════════════════════════════════════════════════\n"
+        "STEP 0 — PARSE REQUEST (do this BEFORE calling any tool)\n"
+        "═══════════════════════════════════════════════════════\n"
+        "Read the customer request and list the DISTINCT PRODUCTS being ordered.\n"
+        "CRITICAL PARSING RULES — violation of these is NOT allowed:\n"
+        "  1. Adjectives such as 'colorful', 'colourful', 'assorted', 'recycled',\n"
+        "     'large', 'heavy', 'standard', 'white', 'high-quality', 'biodegradable'\n"
+        "     describe a product — they are NOT separate products themselves.\n"
+        "  2. Treat the FULL phrase (adjective + noun) as ONE product name, then map\n"
+        "     the noun to the catalog. Examples:\n"
+        "       • '500 colorful poster paper'  → ONE item: 500 × Poster paper\n"
+        "       • '300 colorful streamers'     → ONE item: 300 × Party streamers\n"
+        "       • '1000 A4 glossy paper'       → ONE item: 1000 × Glossy paper\n"
+        "       • '200 recycled cardstock'     → ONE item: 200 × Cardstock\n"
+        "       • '500 biodegradable cups'     → ONE item: 500 × Paper cups\n"
+        "  3. Do NOT split a single phrase into two products.\n"
+        "     WRONG: '500 colorful poster paper' → Colored paper (500) + Poster paper (500)\n"
+        "     RIGHT: '500 colorful poster paper' → Poster paper (500) only\n"
+        "  4. Items not in the catalog (balloons, tickets, cardboard) → skip them\n"
+        "     and inform the customer they are unavailable.\n"
+        "Only after you have correctly identified each distinct product should you\n"
+        "proceed to the numbered steps below.\n\n"
         "IMPORTANT: When calling managed agents, ALWAYS pass ONLY the 'task' argument as a plain string. "
         "Do NOT pass 'additional_args', 'request_date', or any other keyword arguments — "
         "embed all needed information (dates, quantities, prices) inside the task string itself.\n\n"
@@ -1174,20 +1399,29 @@ orchestrator = ToolCallingAgent(
         "      - 'colored paper', 'assorted colored paper'              → use catalog name 'Colored paper'\n"
         "      - 'recycled cardstock' or 'high-quality recycled'        → use catalog name 'Recycled paper' or 'Cardstock'\n"
         "      - poster boards / poster paper                           → use catalog name 'Poster paper' or 'Large poster paper (24x36 inches)'\n"
+        "      - 'colorful poster paper', 'colourful poster paper'        → use catalog name 'Poster paper' (NOT Colored paper — 'colorful' is just an adjective here)\n"
+        "      - 'colorful construction paper'                            → use catalog name 'Construction paper' (NOT Colored paper)\n"
+        "      CRITICAL: when 'colorful'/'colourful' modifies another paper type, it is ONLY an adjective describing colour variety — do NOT treat it as a separate request for 'Colored paper'.\n"
         "    If after mapping the result from get_catalog_item_price_tool still says 'not found', "
         "    that item is NOT in our catalog — do NOT pass it to any sub-agent. "
-        "    Tell the customer that specific item is unavailable from The Beaver's Choice. "
-        "    Only proceed with items where you confirmed a valid price from get_catalog_item_price_tool.\n"
+        "    Tell the customer that specific item is unavailable from The Beaver's Choice.\n"
+        "    ██ CRITICAL — PARTIAL ORDER RULE ██\n"
+        "    Finding one unavailable item does NOT cancel or stop the rest of the order.\n"
+        "    You MUST continue processing ALL remaining confirmed catalog items normally.\n"
+        "    WRONG: Customer asks for Poster paper + Balloons → Balloons not found → you stop everything.\n"
+        "    RIGHT: Customer asks for Poster paper + Balloons → Balloons not found → "
+        "note 'Balloons unavailable', then continue steps 2-7 for Poster paper.\n"
+        "    Only pass confirmed catalog items (with valid prices) to steps 2-7.\n"
+
         "2. Ask inventory_agent to check stock ONLY for confirmed catalog items. "
         "   Include the REQUEST DATE and all item names inside the task string. "
         "   ALWAYS pass the REQUEST DATE (not the customer's desired delivery date) as request_date, "
         "   so stock levels reflect what is available when the order is placed.\n"
-        "3. Based on inventory_agent's report, split confirmed catalog items into two lists FIRST:\n"
-        "   SELL (fulfill from stock): items where \u2705 Stock OK AND available stock >= requested quantity.\n"
-        "   REORDER (supplier order): items where \u26a0\ufe0f REORDER REQUIRED OR available stock < requested quantity.\n"
-        "   Non-catalog items go in neither list — inform the customer they are unavailable.\n"
-        "   IMPORTANT: items flagged \u26a0\ufe0f REORDER REQUIRED must be reordered EVEN IF the customer ordered "
-        "   a small quantity currently in stock — the minimum threshold rule takes priority.\n"
+        "3. Review inventory_agent's report to understand stock availability and delivery dates.\n"
+        "   Non-catalog items: inform the customer they are unavailable.\n"
+        "   NOTE: You do NOT need to classify items as SELL or REORDER — "
+        "smart_order_tool inside order_agent makes that decision automatically in code.\n"
+
         "4. Ask quoting_agent to generate a CUSTOMER-FACING price quote using EXACTLY this task format:\n"
         "   'DISCOUNT RULE:\n"
         "    - The 10% bulk discount applies to CUSTOMER SALE PRICES (qty >= 500 per line item).\n"
@@ -1204,41 +1438,63 @@ orchestrator = ToolCallingAgent(
         "    For each line: show base price, discount (if qty>=500), discounted subtotal.\n"
         "    Show grand total = sum of all customer-facing subtotals.'\n"
         "   Do NOT include stock counts, delivery dates, supplier costs, or reorder flags in the quoting task.\n"
-        "5. Call inventory_agent again for REORDER items ONLY to get the supplier delivery date for each.\n"
-        "   Pass the request date and REORDER item list. Use get_delivery_date_tool via inventory_agent.\n"
-        "   You need the delivery_date for each reorder item to pass to order_agent.\n"
-        "6. Call order_agent EXACTLY ONCE. This call is MANDATORY even when ALL items are out of stock. "
-        "   Build the task string using EXACTLY this format (replace <REQUEST_DATE> with the actual\n"
-        "   request date in YYYY-MM-DD format — this is the date the customer placed the order):\n"
-        "   CRITICAL: Use ONLY the exact official catalog item names (as returned by get_catalog_item_price_tool\n"
-        "   in Step 1) in the task string — NEVER use the customer's description wording.\n"
-        "   ---\n"
-        "   REQUEST DATE: <REQUEST_DATE>\n"
-        "   SELL (fulfill from current stock):\n"
-        "   - <catalog_item_name>, qty=<N>, unit_price=$<P>, order_date=<REQUEST_DATE>, bulk_discount=<True if qty>=500 else False>\n"
-        "   (IMPORTANT: order_date for ALL SELL items MUST be the REQUEST DATE above — never use any other date)\n"
-        "   (repeat for each IN_STOCK item; write 'None' if list is empty)\n"
-        "   \n"
-        "   REORDER (order from supplier — reorder_stock_tool handles both supplier purchase and customer sale):\n"
-        "   - <catalog_item_name>, qty=<N>, unit_price=$<catalog_unit_price>, order_date=<REQUEST_DATE>, "
-        "customer_sale_price=$<catalog_unit_price>, delivery_date=<YYYY-MM-DD>\n"
-        "   (repeat for each REORDER item; write 'None' if list is empty)\n"
-        "   ---\n"
-        "   IMPORTANT: For REORDER items, pass customer_sale_price = catalog unit price. "
-        "   The tool automatically records the customer sale with bulk discount (if qty>=500) on delivery_date. "
-        "   delivery_date MUST be a valid 2025 date in YYYY-MM-DD format — use ONLY the date returned by "
-        "   inventory_agent in step 5, never guess or invent a date. "
+        "5. Call inventory_agent to get the supplier delivery date for ALL confirmed catalog items "
+        "(not just REORDER — smart_order_tool needs delivery_date for every item in case it decides to reorder). "
+        "Pass the request date and the full item list.\n"
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░\n"
+        "6. ██ MANDATORY ██ Call order_agent EXACTLY ONCE — NO EXCEPTIONS.\n"
+        "   Skipping this step is NOT allowed, even if:\n"
+        "     • ALL items appear to be in stock\n"
+        "     • The customer only asked for a quote\n"
+        "     • You already have pricing from quoting_agent\n"
+        "   A quote without a recorded transaction has ZERO business value.\n"
+        "   You MUST call order_agent after step 5, always.\n"
+        "░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░\n"
+        "   Build the task string in this format:\n"
+        "   REQUEST DATE: <YYYY-MM-DD>\n"
+        "   ITEMS:\n"
+        "   - <catalog_item_name>, qty=<N>, unit_price=$<P>, customer_sale_price=$<P>, "
+        "delivery_date=<YYYY-MM-DD from step 5>\n"
+        "   (repeat for every confirmed catalog item)\n"
+        "   RULES:\n"
+        "   - Use ONLY exact official catalog names from get_catalog_item_price_tool\n"
+        "   - customer_sale_price = same as unit_price (bulk discount applied by tool)\n"
+        "   - delivery_date = date from inventory_agent step 5 (NEVER guess a date)\n"
+        "   - smart_order_tool will decide SELL vs REORDER automatically in Python code\n"
         "   Never call order_agent more than once.\n"
+
         "CRITICAL RULE: Never tell the customer an order is placed unless order_agent has explicitly confirmed it. "
         "You CANNOT fulfill orders or check inventory yourself — always delegate.\n"
-        "7. Return a clear, friendly final response with:\n"
-        "   • For SELL items: quantity, unit price, total, discount note (if qty>=500: '10% bulk discount applied'; "
-        "if qty<500: 'no discount — quantity below 500 units'), transaction ID\n"
-        "   • For REORDER items: what the customer will pay on delivery date (with discount note as above), "
-        "supplier delivery date, and supplier transaction ID + customer sale transaction ID\n"
-        "   • Do NOT say an item is 'not eligible for discounts' — all items get the discount if qty>=500\n"
-        "   • Clearly separate what the customer owes from internal supplier costs\n"
-        "   • Any catalog items unavailable are noted and explained to the customer."
+        "7. Return a clear, friendly FINAL RESPONSE using this exact structure:\n"
+        "\n"
+        "   ## Order Summary\n"
+        "   List every catalog item with:\n"
+        "   - Item name, quantity\n"
+        "   - Status: SELL (from stock) or REORDER (from supplier)\n"
+        "   - Transaction ID(s) from order_agent\n"
+        "   - Delivery date (for REORDER items)\n"
+        "\n"
+        "   ## Financial Breakdown\n"
+        "   Show ALL inflows (+) and outflows (-) using this EXACT format:\n"
+        "\n"
+        "   INFLOWS (what the customer pays to us):\n"
+        "   + <Item>: <qty> units × $<discounted_unit_price> = +$<subtotal>  [10% discount applied / no discount]\n"
+        "   (one line per item sold or reordered for a customer)\n"
+        "\n"
+        "   OUTFLOWS (what we pay to the supplier):\n"
+        "   - <Item>: <qty> units × $<catalog_unit_price> = -$<subtotal>  [supplier cost, no discount]\n"
+        "   (one line per REORDER item only — SELL items have no outflow since stock is already owned)\n"
+        "\n"
+        "   NET BALANCE = Total Inflows - Total Outflows\n"
+        "   (positive = net revenue this order; negative = cost exceeds revenue this order)\n"
+        "\n"
+        "   Rules for the financial breakdown:\n"
+        "   • SELL items: inflow only (+ customer revenue). No outflow — stock was already purchased.\n"
+        "   • REORDER items: BOTH an inflow (+ customer pays discounted price) AND an outflow (- supplier cost at full catalog price).\n"
+        "   • Supplier outflow is ALWAYS full catalog price — NEVER discounted.\n"
+        "   • Customer inflow is discounted price if qty >= 500, else full price.\n"
+        "   • NEVER add supplier costs to the customer subtotals. They are separate columns.\n"
+        "   • Items not in the catalog must be EXPLICITLY listed as unavailable — do not silently drop them."
     ),
     max_steps=14,
 )
