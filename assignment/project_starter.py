@@ -903,6 +903,32 @@ def get_delivery_date_tool(request_date: str, quantity: int) -> str:
     )
 
 
+# ── Financial tools ──────────────────────────────────────────────────────────
+
+@tool
+def cash_balance_tool(as_of_date: str) -> str:
+    """
+    Check the company's available cash balance as of a specific date.
+
+    Use this tool to verify available funds before making large supplier orders,
+    to ensure the company has sufficient cash to cover the cost of a reorder.
+    If the cash balance is too low, flag the risk before proceeding with a
+    large stock purchase from the supplier.
+
+    Args:
+        as_of_date: ISO format date string (YYYY-MM-DD) for which the cash
+                    balance should be calculated.
+
+    Returns:
+        A formatted message showing the current cash balance as of the given date.
+    """
+    balance = get_cash_balance(as_of_date)
+    return (
+        f"Cash balance as of {as_of_date}: ${balance:,.2f}. "
+        f"{'Sufficient funds available for supplier orders.' if balance > 500 else 'WARNING: Low cash balance — verify order cost before proceeding.'}"
+    )
+
+
 # ── Quoting tools ────────────────────────────────────────────────────────────
 
 @tool
@@ -1310,6 +1336,7 @@ order_agent = ToolCallingAgent(
         get_catalog_items_tool,
         normalize_item_name_tool,
         get_catalog_item_price_tool,
+        cash_balance_tool,
         smart_order_tool,
     ],
     model=model,
@@ -1324,6 +1351,13 @@ order_agent = ToolCallingAgent(
         "Skip any item where normalize_item_name_tool returns 'Could not map'.\n"
         "STEP 1 — Price: Call get_catalog_item_price_tool to get the official unit price. "
         "Never use $0 or a guessed price.\n"
+        "STEP 1.5 — Cash Check (REORDER only): Before placing any supplier REORDER, "
+        "call cash_balance_tool with the order_date to check available funds. "
+        "Calculate supplier cost = unit_price × quantity (supplier cost is NEVER discounted). "
+        "RULE: Only proceed with the REORDER if available cash >= supplier cost. "
+        "If available cash < supplier cost, DO NOT call smart_order_tool for that item. "
+        "Instead, include a message in your final answer explaining that the item could not be "
+        "reordered due to insufficient funds, and state the cash balance and required cost.\n"
         "STEP 2 — Order: Call smart_order_tool for EVERY item with these parameters:\n"
         "  - item_name          : normalized catalog name from STEP 0\n"
         "  - quantity           : units the customer wants (TOTAL quantity — see rule below)\n"
@@ -1340,7 +1374,7 @@ order_agent = ToolCallingAgent(
         "STEP 3 — Call final_answer with a clear summary of every item processed, "
         "the decision made (SELL or REORDER), and all transaction IDs."
     ),
-    max_steps=10,
+    max_steps=15,
 )
 
 # ---------------------------------------------------------------------------
